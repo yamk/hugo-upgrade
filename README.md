@@ -1,5 +1,7 @@
 # hugo-upgrade
 
+[日本語](README.ja.md)
+
 **Hugo install / upgrade tool**
 
 Install or upgrade [Hugo](https://gohugo.io/) static site generator from [GitHub releases](https://github.com/gohugoio/hugo/releases).
