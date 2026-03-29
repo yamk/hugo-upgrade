@@ -94,6 +94,58 @@ sudo hugo-upgrade -u -e -f
 sudo hugo-upgrade -u -e -d /opt/bin
 ```
 
+### Sample output
+
+**Install (first time):**
+
+```
+$ sudo hugo-upgrade -u -e
+INFO     Installed : not found at /usr/local/bin/hugo
+INFO     Checking  : GitHub for latest Hugo release...
+INFO     Available : Hugo 0.159.1  (extended, amd64, published 2026-03-26)
+INFO     Action    : installing Hugo 0.159.1 (extended)...
+INFO     Download  : hugo_extended_0.159.1_linux-amd64.tar.gz
+  hugo_extended_0.159.1_linux-amd64.tar.gz  [============================] 100%   18.3 / 18.3 MB
+INFO     Verify    : SHA256 checksum...
+INFO     Verify    : OK
+INFO     Install   : /usr/local/bin/hugo
+INFO     Done      : Hugo 0.159.1 (extended) installed successfully.
+
+$ hugo version
+hugo v0.159.1+extended linux/amd64 BuildDate=2026-03-26T09:54:15Z VendorInfo=gohugoio
+```
+
+**Already up to date:**
+
+```
+$ hugo-upgrade -c -e
+INFO     Installed : Hugo 0.159.1 (extended)  (/usr/local/bin/hugo)
+INFO     Checking  : GitHub for latest Hugo release...
+INFO     Available : Hugo 0.159.1  (extended, amd64, published 2026-03-26)
+INFO     Status    : already up to date.
+```
+
+**Edition mismatch (forgot `-e`):**
+
+```
+$ sudo hugo-upgrade -u
+INFO     Installed : Hugo 0.159.1 (extended)  (/usr/local/bin/hugo)
+INFO     Checking  : GitHub for latest Hugo release...
+INFO     Available : Hugo 0.159.1  (standard, amd64, published 2026-03-26)
+WARNING  Warning   : installed edition is extended, but standard was requested.
+WARNING             Use -f to force the edition change.
+```
+
+**Dry run:**
+
+```
+$ hugo-upgrade -n -e
+INFO     Installed : Hugo 0.159.1 (extended)  (/usr/local/bin/hugo)
+INFO     Checking  : GitHub for latest Hugo release...
+INFO     Available : Hugo 0.159.1  (extended, amd64, published 2026-03-26)
+INFO     Status    : already up to date.
+```
+
 ### Exit codes
 
 | Code | Meaning |
