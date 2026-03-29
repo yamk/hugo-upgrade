@@ -1,0 +1,693 @@
+#!/usr/bin/env python3
+"""
+hugo-upgrade — Install or upgrade Hugo from GitHub releases.
+
+Place at /usr/local/bin/hugo-upgrade (chmod 755)
+Run with sudo for installation. Run without sudo for --check / --dry-run.
+
+Supported platforms:
+  RPM-based : RHEL / Rocky / AlmaLinux 8.x (*), 9.x, 10.x
+  Debian    : Debian 11 (Bullseye) or later
+  Ubuntu    : Ubuntu 20.04 LTS or later
+
+  (*) RHEL/Rocky/Alma 8.x ships Python 3.6 by default.
+      Python 3.8+ is required:  sudo dnf install python3.8
+
+Requires:
+  Python 3.8+, curl is NOT required (uses urllib from stdlib)
+
+Exit codes:
+  0  success (up to date, or installed successfully)
+  1  update available or not installed (--check only), or general error
+  2  GitHub API rate limit exceeded
+  3  checksum mismatch (security warning)
+130  interrupted by user
+"""
+
+# Python version check must come before any 3.7+ imports (e.g. dataclasses).
+import sys as _sys
+if _sys.version_info < (3, 8):
+    _sys.stderr.write(
+        f"hugo-upgrade requires Python 3.8 or later "
+        f"(found Python {_sys.version_info.major}.{_sys.version_info.minor}).\n"
+        f"On RHEL/Rocky/AlmaLinux 8:  sudo dnf install python3.8\n"
+    )
+    _sys.exit(1)
+
+import argparse
+import dataclasses
+import hashlib
+import json
+import logging
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.request
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+SCRIPT_VERSION = "0.1"
+GITHUB_API_LATEST = "https://api.github.com/repos/gohugoio/hugo/releases/latest"
+GITHUB_API_TAG    = "https://api.github.com/repos/gohugoio/hugo/releases/tags/v{version}"
+HUGO_RELEASES_BASE = "https://github.com/gohugoio/hugo/releases/download"
+DEFAULT_INSTALL_DIR = Path("/usr/local/bin")
+DEFAULT_TIMEOUT     = 30        # seconds
+CHUNK_SIZE          = 65536     # 64 KiB
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+class HugoUpgradeError(Exception):
+    """Base exception."""
+
+class NetworkError(HugoUpgradeError):
+    """HTTP / network failure."""
+
+class RateLimitError(NetworkError):
+    """GitHub API 403 rate limit."""
+
+class AssetNotFoundError(HugoUpgradeError):
+    """Expected asset not found in the release."""
+
+class ChecksumError(HugoUpgradeError):
+    """Checksum fetch, parse, or verification failure."""
+
+class ChecksumMismatchError(ChecksumError):
+    def __init__(self, expected: str, actual: str):
+        super().__init__(f"expected {expected[:16]}…, got {actual[:16]}…")
+        self.expected = expected
+        self.actual   = actual
+
+class InstallError(HugoUpgradeError):
+    """Binary extraction or placement failed."""
+
+# =============================================================================
+# Data classes
+# =============================================================================
+
+@dataclasses.dataclass(frozen=True)
+class Config:
+    install_dir:    Path
+    extended:       bool
+    upgrade:        bool
+    force:          bool
+    dry_run:        bool
+    check_only:     bool
+    quiet:          bool
+    arch:           str
+    pinned_version: Optional[str]
+
+@dataclasses.dataclass(frozen=True)
+class ReleaseInfo:
+    version:           str   # "0.145.0"
+    asset_name:        str   # "hugo_extended_0.145.0_linux-amd64.tar.gz"
+    tarball_url:       str
+    checksum_filename: str   # "hugo_0.145.0_checksums.txt"
+    checksum_url:      str
+    published_at:      str   # ISO 8601
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+_ANSI: Dict[str, str] = {
+    "DEBUG":   "\033[36m",
+    "INFO":    "\033[32m",
+    "WARNING": "\033[33m",
+    "ERROR":   "\033[31m",
+    "RESET":   "\033[0m",
+}
+
+class _ColorFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        color = _ANSI.get(record.levelname, "")
+        reset = _ANSI["RESET"]
+        record.levelname = f"{color}{record.levelname:<8}{reset}"
+        return super().format(record)
+
+def setup_logging(quiet: bool) -> logging.Logger:
+    logger  = logging.getLogger("hugo-upgrade")
+    logger.setLevel(logging.WARNING if quiet else logging.INFO)
+    handler = logging.StreamHandler(sys.stderr)
+    fmt     = "%(levelname)s %(message)s"
+    if sys.stderr.isatty():
+        handler.setFormatter(_ColorFormatter(fmt))
+    else:
+        handler.setFormatter(logging.Formatter(fmt))
+    logger.addHandler(handler)
+    return logger
+
+# =============================================================================
+# Version utilities
+# =============================================================================
+
+_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+)")
+
+def _parse_version(text: str) -> Optional[str]:
+    """Extract 'X.Y.Z' from strings like 'hugo v0.145.0+extended linux/amd64'."""
+    m = _VERSION_RE.search(text)
+    return m.group(1) if m else None
+
+def _parse_extended(text: str) -> bool:
+    """Return True if version string indicates the extended edition."""
+    return "+extended" in text
+
+def _vtuple(ver: str) -> Tuple[int, ...]:
+    return tuple(int(x) for x in ver.split("."))
+
+def is_newer(candidate: str, installed: str) -> bool:
+    return _vtuple(candidate) > _vtuple(installed)
+
+def validate_version(ver: str) -> str:
+    if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+        raise ValueError(
+            f"Invalid version format: '{ver}'  (expected X.Y.Z, e.g. 0.145.0)"
+        )
+    return ver
+
+# =============================================================================
+# Architecture detection
+# =============================================================================
+
+_ARCH_MAP: Dict[str, str] = {
+    "x86_64":  "amd64",
+    "amd64":   "amd64",
+    "aarch64": "arm64",
+    "arm64":   "arm64",
+}
+
+def detect_arch() -> str:
+    machine = platform.machine().lower()
+    arch = _ARCH_MAP.get(machine)
+    if arch is None:
+        raise HugoUpgradeError(
+            f"Unsupported architecture: {machine}  Use -a to specify amd64 or arm64."
+        )
+    return arch
+
+# =============================================================================
+# HTTP helper
+# =============================================================================
+
+def _http_get(url: str) -> urllib.request.addinfourl:
+    headers = {
+        "User-Agent": f"hugo-upgrade/{SCRIPT_VERSION}",
+        "Accept":     "application/vnd.github.v3+json",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        return urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            raise RateLimitError(
+                "GitHub API rate limit exceeded (60 req/hr unauthenticated). "
+                "Try again later."
+            ) from exc
+        if exc.code == 404:
+            raise AssetNotFoundError(f"Not found: {url}") from exc
+        raise NetworkError(f"HTTP {exc.code} {exc.reason} — {url}") from exc
+    except urllib.error.URLError as exc:
+        raise NetworkError(f"Network error: {exc.reason} — {url}") from exc
+
+# =============================================================================
+# Release info
+# =============================================================================
+
+def _asset_name(version: str, extended: bool, arch: str) -> str:
+    edition = "extended_" if extended else ""
+    return f"hugo_{edition}{version}_linux-{arch}.tar.gz"
+
+def _checksum_filename(version: str) -> str:
+    return f"hugo_{version}_checksums.txt"
+
+def fetch_release(
+    pinned_version: Optional[str],
+    extended: bool,
+    arch: str,
+) -> ReleaseInfo:
+    """Query GitHub API and return ReleaseInfo for the target release."""
+    if pinned_version:
+        url = GITHUB_API_TAG.format(version=pinned_version)
+    else:
+        url = GITHUB_API_LATEST
+
+    with _http_get(url) as resp:
+        data = json.loads(resp.read().decode())
+
+    tag     = data.get("tag_name", "")
+    version = _parse_version(tag)
+    if not version:
+        raise HugoUpgradeError(f"Could not parse version from API tag: '{tag}'")
+
+    asset_name    = _asset_name(version, extended, arch)
+    cksum_file    = _checksum_filename(version)
+    base_url      = f"{HUGO_RELEASES_BASE}/v{version}"
+    tarball_url   = f"{base_url}/{asset_name}"
+    checksum_url  = f"{base_url}/{cksum_file}"
+    published_at  = data.get("published_at", "unknown")
+
+    # Verify the asset exists in the release (assets list may be empty for very
+    # new releases; skip the check in that case rather than failing)
+    assets = {a["name"] for a in data.get("assets", [])}
+    if assets and asset_name not in assets:
+        edition_label = "extended" if extended else "standard"
+        raise AssetNotFoundError(
+            f"'{asset_name}' not found in release v{version}. "
+            f"The {edition_label} edition may not be available for '{arch}'."
+        )
+
+    return ReleaseInfo(
+        version=version,
+        asset_name=asset_name,
+        tarball_url=tarball_url,
+        checksum_filename=cksum_file,
+        checksum_url=checksum_url,
+        published_at=published_at,
+    )
+
+# =============================================================================
+# Download with progress bar
+# =============================================================================
+
+def download_file(url: str, dest: Path, label: str, quiet: bool) -> None:
+    """Stream-download *url* to *dest*, printing a progress bar when possible."""
+    with _http_get(url) as resp:
+        total      = int(resp.headers.get("Content-Length", 0) or 0)
+        downloaded = 0
+        with dest.open("wb") as fh:
+            while True:
+                chunk = resp.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if not quiet and sys.stderr.isatty() and total > 0:
+                    pct    = downloaded * 100 // total
+                    bar_w  = 28
+                    filled = pct * bar_w // 100
+                    bar    = "=" * filled + "-" * (bar_w - filled)
+                    done   = downloaded / 1_048_576
+                    total_ = total       / 1_048_576
+                    sys.stderr.write(
+                        f"\r  {label}  [{bar}] {pct:3d}%  "
+                        f"{done:5.1f} / {total_:.1f} MB"
+                    )
+                    sys.stderr.flush()
+
+    if not quiet and sys.stderr.isatty() and total > 0:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+# =============================================================================
+# Checksum verification
+# =============================================================================
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def _parse_checksums(text: str) -> Dict[str, str]:
+    """Parse 'sha256hex  filename' lines → {filename: hex}."""
+    result: Dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            result[parts[1]] = parts[0]
+    return result
+
+def verify_checksum(archive: Path, asset_name: str, checksum_url: str) -> None:
+    """Download checksums.txt and verify SHA256 of *archive*."""
+    with _http_get(checksum_url) as resp:
+        checksum_map = _parse_checksums(resp.read().decode())
+
+    if asset_name not in checksum_map:
+        raise ChecksumError(f"'{asset_name}' not listed in checksums file.")
+
+    expected = checksum_map[asset_name]
+    actual   = _sha256(archive)
+    if actual != expected:
+        raise ChecksumMismatchError(expected, actual)
+
+# =============================================================================
+# Install helpers
+# =============================================================================
+
+def get_installed_info(hugo_bin: Path) -> Optional[Tuple[str, bool]]:
+    """Return (version, is_extended) for the installed hugo, or None if not found."""
+    if not hugo_bin.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(hugo_bin), "version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        output  = result.stdout + result.stderr
+        version = _parse_version(output)
+        if version is None:
+            return None
+        return (version, _parse_extended(output))
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+
+def install_from_archive(archive: Path, hugo_bin: Path) -> None:
+    """Extract only the 'hugo' member and install it atomically."""
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            try:
+                member = tf.getmember("hugo")
+            except KeyError:
+                raise InstallError("'hugo' binary not found in archive.")
+
+            src = tf.extractfile(member)
+            if src is None:
+                raise InstallError("'hugo' member in archive is not a regular file.")
+
+            tmp_bin = hugo_bin.parent / ".hugo-upgrade-tmp"
+            try:
+                with src, tmp_bin.open("wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                tmp_bin.chmod(0o755)
+                os.replace(tmp_bin, hugo_bin)   # atomic on same filesystem
+            except Exception:
+                try:
+                    tmp_bin.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+
+    except tarfile.TarError as exc:
+        raise InstallError(f"Failed to open archive: {exc}") from exc
+
+# =============================================================================
+# Argument parser
+# =============================================================================
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that prints a version/title header before usage."""
+    def format_help(self) -> str:
+        header = f"hugo-upgrade {SCRIPT_VERSION}  Hugo install / upgrade tool\n\n"
+        return header + super().format_help()
+
+
+def build_parser() -> _ArgumentParser:
+    parser = _ArgumentParser(
+        prog="hugo-upgrade",
+        description="Install or upgrade Hugo from GitHub releases.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  sudo hugo-upgrade -u               install / upgrade standard edition
+  sudo hugo-upgrade -u -e            install / upgrade extended edition
+  hugo-upgrade -c                    check for updates (no install, exit 1 if available)
+  sudo hugo-upgrade -u -V 0.140.0   install specific version
+  sudo hugo-upgrade -u -d /opt/bin   install to custom directory
+  hugo-upgrade -n -e                 dry run for extended edition
+""",
+    )
+    parser.add_argument(
+        "-e", "--extended",
+        action="store_true",
+        help="use Hugo extended edition (includes SCSS/Sass support)",
+    )
+    parser.add_argument(
+        "-d", "--dir",
+        dest="install_dir",
+        type=Path,
+        default=DEFAULT_INSTALL_DIR,
+        metavar="DIR",
+        help=f"installation directory (default: {DEFAULT_INSTALL_DIR})",
+    )
+    parser.add_argument(
+        "-V", "--hugo-version",
+        dest="pinned_version",
+        metavar="VERSION",
+        help="install a specific Hugo version, e.g. 0.145.0",
+    )
+    parser.add_argument(
+        "-a", "--arch",
+        choices=["amd64", "arm64"],
+        metavar="ARCH",
+        help="target architecture: amd64 or arm64 (default: auto-detect)",
+    )
+    parser.add_argument(
+        "-u", "--upgrade",
+        action="store_true",
+        help="perform install / upgrade (required to make changes)",
+    )
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="reinstall even if already at the target version",
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="show what would be done without making any changes",
+    )
+    parser.add_argument(
+        "-c", "--check",
+        action="store_true",
+        dest="check_only",
+        help="check for updates only, do not install (exit 1 if update is available)",
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="suppress informational output (errors are still shown)",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"%(prog)s {SCRIPT_VERSION}",
+    )
+    return parser
+
+# =============================================================================
+# Orchestrator
+# =============================================================================
+
+class HugoUpgrader:
+    def __init__(self, config: Config) -> None:
+        self.cfg = config
+        self.log = logging.getLogger("hugo-upgrade")
+
+    def run(self) -> int:
+        cfg      = self.cfg
+        hugo_bin = cfg.install_dir / "hugo"
+
+        # 1. Check installed version and edition
+        installed_info = get_installed_info(hugo_bin)
+        if installed_info:
+            installed, installed_ext = installed_info
+            inst_edition = "extended" if installed_ext else "standard"
+            self.log.info("Installed : Hugo %s (%s)  (%s)", installed, inst_edition, hugo_bin)
+        else:
+            installed      = None
+            installed_ext  = None
+            inst_edition   = None
+            self.log.info("Installed : not found at %s", hugo_bin)
+
+        # 2. Fetch release info from GitHub
+        self.log.info("Checking  : GitHub for latest Hugo release...")
+        release       = fetch_release(cfg.pinned_version, cfg.extended, cfg.arch)
+        edition_label = "extended" if cfg.extended else "standard"
+        self.log.info(
+            "Available : Hugo %s  (%s, %s, published %s)",
+            release.version, edition_label, cfg.arch, release.published_at[:10],
+        )
+
+        # 3. Detect edition mismatch
+        edition_mismatch = installed_ext is not None and installed_ext != cfg.extended
+
+        # 4. Decide whether installation is needed
+        needs_install = (
+            cfg.force
+            or installed is None
+            or is_newer(release.version, installed)
+            or edition_mismatch
+        )
+
+        if not needs_install:
+            self.log.info("Status    : already up to date.")
+            return 0
+
+        # 5. --check: report status and exit without installing
+        if cfg.check_only:
+            if installed is None:
+                self.log.info("Status    : Hugo is not installed.")
+            elif edition_mismatch:
+                self.log.warning(
+                    "Status    : edition mismatch  installed=%s, requested=%s"
+                    "  →  use -f to apply",
+                    inst_edition, edition_label,
+                )
+            else:
+                self.log.info(
+                    "Status    : update available  %s  →  %s",
+                    installed, release.version,
+                )
+            return 1
+
+        # 6. Edition mismatch without --force → warn and abort
+        if edition_mismatch and not cfg.force:
+            self.log.warning(
+                "Warning   : installed edition is %s, but %s was requested.",
+                inst_edition, edition_label,
+            )
+            self.log.warning(
+                "           Use -f to force the edition change."
+            )
+            return 1
+
+        # 7. Announce intended action
+        if installed is None:
+            self.log.info(
+                "Action    : installing Hugo %s (%s)...",
+                release.version, edition_label,
+            )
+        elif edition_mismatch:
+            self.log.info(
+                "Action    : changing edition  %s → %s  (Hugo %s)...",
+                inst_edition, edition_label, release.version,
+            )
+        else:
+            self.log.info(
+                "Action    : upgrading Hugo %s → %s (%s)...",
+                installed, release.version, edition_label,
+            )
+
+        # 6. --dry-run: show plan and exit
+        if cfg.dry_run:
+            self.log.info("[dry-run]   asset    : %s", release.asset_name)
+            self.log.info("[dry-run]   source   : %s", release.tarball_url)
+            self.log.info("[dry-run]   dest     : %s", hugo_bin)
+            return 0
+
+        # 7. Require --upgrade to proceed with actual installation
+        if not cfg.upgrade:
+            self.log.info(
+                "Hint      : run with -u / --upgrade to apply changes."
+            )
+            return 0
+
+        if not os.access(cfg.install_dir, os.W_OK):
+            raise InstallError(
+                f"Install directory is not writable: {cfg.install_dir}\n"
+                "  Hint: run with sudo."
+            )
+
+        # 9. Download → verify → install
+        with tempfile.TemporaryDirectory(prefix="hugo-upgrade-") as tmp_dir:
+            archive = Path(tmp_dir) / release.asset_name
+
+            self.log.info("Download  : %s", release.asset_name)
+            download_file(
+                release.tarball_url, archive,
+                release.asset_name, cfg.quiet,
+            )
+
+            self.log.info("Verify    : SHA256 checksum...")
+            verify_checksum(archive, release.asset_name, release.checksum_url)
+            self.log.info("Verify    : OK")
+
+            self.log.info("Install   : %s", hugo_bin)
+            install_from_archive(archive, hugo_bin)
+
+        # 10. Confirm installed version and edition
+        confirmed_info = get_installed_info(hugo_bin)
+        if confirmed_info:
+            confirmed_ver, confirmed_ext = confirmed_info
+            confirmed_edition = "extended" if confirmed_ext else "standard"
+            self.log.info(
+                "Done      : Hugo %s (%s) installed successfully.",
+                confirmed_ver, confirmed_edition,
+            )
+        else:
+            self.log.warning("Installed, but post-install version check failed.")
+
+        return 0
+
+# =============================================================================
+# Entry point
+# =============================================================================
+
+def main() -> None:
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    # Validate pinned version format before doing anything else
+    if args.pinned_version:
+        try:
+            args.pinned_version = validate_version(args.pinned_version)
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    # Resolve architecture
+    arch = args.arch
+    if arch is None:
+        try:
+            arch = detect_arch()
+        except HugoUpgradeError as exc:
+            parser.error(str(exc))
+
+    # No actionable option given → show help
+    if not any([args.upgrade, args.check_only, args.dry_run]):
+        parser.print_help()
+        sys.exit(0)
+
+    config = Config(
+        install_dir    = args.install_dir.resolve(),
+        extended       = args.extended,
+        upgrade        = args.upgrade,
+        force          = args.force,
+        dry_run        = args.dry_run,
+        check_only     = args.check_only,
+        quiet          = args.quiet,
+        arch           = arch,
+        pinned_version = args.pinned_version,
+    )
+
+    log      = setup_logging(config.quiet)
+    upgrader = HugoUpgrader(config)
+
+    try:
+        sys.exit(upgrader.run())
+    except RateLimitError as exc:
+        log.error("GitHub rate limit: %s", exc)
+        sys.exit(2)
+    except ChecksumMismatchError as exc:
+        log.error("SECURITY: checksum mismatch — %s", exc)
+        sys.exit(3)
+    except AssetNotFoundError as exc:
+        log.error("Asset not found: %s", exc)
+        sys.exit(1)
+    except HugoUpgradeError as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.stderr.write("\nInterrupted.\n")
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
